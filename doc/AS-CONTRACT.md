@@ -59,6 +59,7 @@
 请求：`{"source":"fanqie","sourceId":"7542602438201576472","refresh":false}`
 - `refresh=false`：若已有缓存且章节数与最新目录一致 → 任务直接 done（updated=false，返回现有 epubUrl，不重抓）；若缓存章节数不一致或缓存损坏 → 全量重抓（updated=true）。
 - `refresh=true`：强制全量重抓并重打 EPUB（updated=true）。
+- 可选部分下载范围 `from`/`to`（0 起始、含两端）：同时给出时只抓该区间章节，EPUB 只含该切片，`totalChapters`/spine 为该切片长度；带范围时不参与整本缓存命中判断。
 
 响应：`{"ok":true,"data":{"jobId":"fanqie.7542602438201576472.a1b2"}}`
 
@@ -70,13 +71,27 @@
   "progress":{"crawled":120,"total":422},
   "epubUrl":null,
   "error":null,
-  "updated":false}}
+  "updated":false,
+  "from":null,
+  "to":null}}
 ```
 - `done` 时 `epubUrl` 必须非空。
 - `failed` 时 `error` = `{code, message}`。
 - `updated` 布尔字段：true=本次真正重抓重打；false=命中缓存。
+- `from`/`to`：该任务请求的部分下载范围（0 起始含）；整本下载为 null。
 - jobId 至少存活 24h；过期返回 `JOB_NOT_FOUND`。
 - 同 bookId 并发去重：返回同一 jobId。
+
+### 2.9 GET /api/catalog?source={id|name}&sourceId={url}
+供前端「部分下载」弹窗拉取目录选章。
+```json
+{"ok":true,"data":{
+  "source":"fanqie","sourceId":"7542602438201576472",
+  "totalChapters":422,
+  "chapters":[{"index":0,"title":"第一章"}]}}
+```
+- `source` 可按 adapter id 或书源名解析。
+- 目录为空 → `SOURCE_ERROR`(502)；source 不存在 → `SOURCE_NOT_FOUND`(404)。
 
 ### 2.6 GET /static/books/{source}/{sourceId}.epub
 - EPUB 文件，`Content-Type: application/epub+zip`。

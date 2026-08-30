@@ -6,7 +6,7 @@ const fs = require("node:fs");
 
 const { loadConfig } = require("./lib/config");
 const { loadAdapters, sourceList, getSource } = require("./lib/registry");
-const { aggregateSearch } = require("./lib/search");
+const { aggregateSearch, resolveSource } = require("./lib/search");
 const { JobManager } = require("./lib/jobs");
 const { fail, parseSearchParams, parseDownloadParams } = require("./lib/errors");
 const { parseBody, logRequest } = require("./lib/util");
@@ -140,9 +140,22 @@ function buildApp(cfg) {
       // POST /api/download
       if (req.method === "POST" && p === "/api/download") {
         const body = await parseBody(req);
-        const { source, sourceId, refresh } = parseDownloadParams(body);
-        const { jobId } = await jobs.create({ source, sourceId, refresh });
+        const { source, sourceId, refresh, from, to } = parseDownloadParams(body);
+        const { jobId } = await jobs.create({ source, sourceId, refresh, from, to });
         ok(res, { jobId });
+        return;
+      }
+
+      // GET /api/catalog?source=<id|name>&sourceId=<url> —— 返回目录供前端做部分下载弹窗
+      if (req.method === "GET" && p === "/api/catalog") {
+        const source = url.searchParams.get("source") || "";
+        const sourceId = url.searchParams.get("sourceId") || "";
+        const adapter = resolveSource(adapters, source) || getSource(adapters, source);
+        if (!adapter) throw fail("SOURCE_NOT_FOUND", "书源不存在");
+        const catalog = await adapter.getCatalog(sourceId);
+        if (!Array.isArray(catalog)) throw fail("SOURCE_ERROR", "目录解析失败");
+        const chapters = catalog.map((c) => ({ index: c.index, title: c.title || `第 ${c.index + 1} 章` }));
+        ok(res, { source: adapter.id, sourceId, totalChapters: chapters.length, chapters });
         return;
       }
 
@@ -157,6 +170,8 @@ function buildApp(cfg) {
           epubUrl: job.epubUrl || null,
           error: job.error ? { code: job.error.code, message: job.error.message } : null,
           updated: job.updated ?? false,
+          from: job.from ?? null,
+          to: job.to ?? null,
         });
         return;
       }

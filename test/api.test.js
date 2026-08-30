@@ -412,3 +412,41 @@ test("ranwen8 正文 @js: DSL 解 base64 混淆(document.writeln) 为纯文本",
   assert.equal(text.includes("&nbsp;"), false, "无裸 &nbsp; 实体");
   assert.match(text, /[\u4e00-\u9fff]/, "切段后为中文正文");
 });
+
+// ---- 12. 部分下载：目录接口 + 章节范围下载 ----
+test("GET /api/catalog 返回目录章节列表（供部分下载弹窗）", async () => {
+  const r = await req("GET", "/api/catalog?source=placeholder&sourceId=p1_0");
+  assert.strictEqual(r.status, 200, r.text);
+  assert.strictEqual(r.json.ok, true);
+  const d = r.json.data;
+  assert.strictEqual(d.source, "placeholder");
+  assert.strictEqual(d.sourceId, "p1_0");
+  assert.strictEqual(d.totalChapters, 128);
+  assert.ok(Array.isArray(d.chapters) && d.chapters.length === 128);
+  assert.strictEqual(d.chapters[0].index, 0);
+  assert.ok(d.chapters[0].title, "章节应有标题");
+});
+
+test("部分下载：from/to 范围只抓该切片，EPUB 章数=切片长度", async () => {
+  // 占位书目录 128 章，请求 [0..4] 共 5 章
+  const job = await downloadAndWait("placeholder", "range_1", { from: 0, to: 4 });
+  assert.strictEqual(job.status, "done");
+  assert.strictEqual(job.from, 0, "job 应记录 from");
+  assert.strictEqual(job.to, 4, "job 应记录 to");
+
+  const epubBuf = await new Promise((resolve, reject) => {
+    const u = new URL(job.epubUrl, base);
+    http.get(u, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve(Buffer.concat(chunks)));
+    }).on("error", reject);
+  });
+  const zip = await JSZip.loadAsync(epubBuf);
+  const opf = await zip.file("OEBPS/content.opf").async("string");
+  const spineCount = (opf.match(/<itemref/g) || []).length;
+  // titles.xhtml + 5 章 = 6
+  assert.strictEqual(spineCount, 6, "spine = titles + 5 切片章");
+  const tm = opf.match(/<meta property="totalChapters">(\d+)<\/meta>/);
+  assert.strictEqual(tm ? Number(tm[1]) : 0, 5, "totalChapters 应为切片长度 5");
+});
