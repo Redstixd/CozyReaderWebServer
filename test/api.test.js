@@ -362,12 +362,53 @@ test("增量更新：强制刷新(refresh=true)即使章数相同也全量重抓
     ...orig,
     async getChapter() { chapterCalls += 1; return "正文"; },
   });
-  try {
+try {
     const forced = await downloadAndWait("placeholder", "incr_force", { refresh: true });
     assert.strictEqual(forced.status, "done");
-    assert.strictEqual(forced.updated, true, "强制刷新应真抓");
-    assert.ok(chapterCalls >= 128, "强制刷新应重新抓取全部章节");
+    assert.strictEqual(forced.updated, true, "ǿ��ˢ��Ӧ��ץ");
+    assert.ok(chapterCalls >= 128, "ǿ��ˢ��Ӧ����ץȡȫ���½�");
   } finally {
     jobs.adapters.set("placeholder", orig);
   }
+});
+
+// ---- 增量：8. 按书源名搜索（前端书源标签传 name 而非 id） ----
+test("POST /api/search 按书源名(source.name)筛选也能命中", async () => {
+  // placeholder 的 name 是「占位书源」，id 是「placeholder」；前端标签传 name
+  const r = await req("POST", "/api/search", { keyword: "斗破", source: "占位书源" });
+  assert.strictEqual(r.status, 200, r.text);
+  assert.strictEqual(r.json.ok, true);
+  assert.ok(Array.isArray(r.json.data.results) && r.json.data.results.length > 0);
+  assert.strictEqual(r.json.data.results[0].source, "placeholder");
+});
+
+// ---- 增量：9. ranwen8 书源 @js: base64 混淆正文解码（用真实规则 DSL） ----
+test("ranwen8 正文 @js: DSL 解 base64 混淆(document.writeln) 为纯文本", async () => {
+  const { runJsDsl, cleanContent } = require("../lib/ruleadapter");
+  const cheerio = require("cheerio");
+  // 从 main.json 取 ranwen8 的真实规则，跑它真正的 @js: 程序
+  const main = JSON.parse(
+    fs.readFileSync(path.join(__dirname, "..", "so-novel", "bundle", "rules", "main.json"), "utf-8")
+  );
+  const rule = main.find((r) => r.url.includes("ranwen8"));
+  assert.ok(rule, "main.json 应含 ranwen8 规则");
+  const dslMatch = String(rule.chapter.content).match(/@js:([\s\S]+)$/);
+  assert.ok(dslMatch && dslMatch[1], "ranwen8 content 应带 @js: DSL");
+
+  // 真实一章开头 base64 载荷：`<br />&nbsp;&nbsp;&nbsp;&nbsp;四人...`（含中文）
+  const b64 =
+    "PGJyIC8+Jm5ic3A7Jm5ic3A7Jm5ic3A7Jm5ic3A75Zub5Liq5Lq65pyA57uI5Zyo55Cq5Lqa5aic5Y+r5Zqj552A6KaB6L+95LiK5Y6755q";
+  const innerHtml = "<br><script>document.writeln(qsbs.bb('" + b64 + "'));</script>";
+
+  // 跑 ranwen8 真实 @js: 程序（内置 qsbs 解码器 + replace）
+  const decoded = runJsDsl(dslMatch[1], innerHtml);
+  assert.equal(decoded.includes("document.writeln"), false, "raw JS 应被解码掉");
+  assert.equal(decoded.includes("qsbs.bb"), false, "base64 载荷应被解码");
+  assert.ok(/[\u4e00-\u9fff]/.test(decoded), "解码后含中文正文");
+
+  // 再经 cleanContent 用规则的 paragraphTag 切段，应只剩干净中文（无 <script>/&nbsp;）
+  const text = cleanContent(decoded, rule.chapter);
+  assert.equal(text.includes("<script"), false, "无 <script 残留");
+  assert.equal(text.includes("&nbsp;"), false, "无裸 &nbsp; 实体");
+  assert.match(text, /[\u4e00-\u9fff]/, "切段后为中文正文");
 });
