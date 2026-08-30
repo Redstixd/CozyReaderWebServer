@@ -4,6 +4,18 @@ CozyReader 的后端聚合服务：搜索聚合、抓全文、打包 EPUB 3、�
 严格按 [`AS-CONTRACT.md`](../AS-CONTRACT.md) 实现，前端对应契约见
 [`READER-CONTRACT.md`](../READER-CONTRACT.md)。
 
+> ⚠️ **克隆后必须手动补齐书源规则（否则只剩 2 个书源）**
+>
+> 绝大多数书源来自 `so-novel/bundle/rules/*.json`（编译自 so-novel 规则仓库）。
+> 该目录是**被复用的上游仓库，已 .gitignore，** **不上传到 GitHub**。因此从
+> GitHub 克隆本仓库后，`so-novel/bundle/rules/` 是**空的**，服务器只会加载
+> `adapters/` 下的 2 个书源（`fanqie` + `placeholder`），聚合搜索缺 11 个规则书源。
+>
+> 补齐步骤：把本机/上游的 `so-novel` 仓库拷回 `WebServer/so-novel`，使
+> `WebServer/so-novel/bundle/rules/main.json` 存在即可（`config.json` 默认
+> `ruleFiles: ["main.json"]` 加载其中 11 个大陆可用源）。补齐后重启 `npm start`，
+> `GET /api/sources` 应返回全部 13 个书源。
+
 ## 快速开始
 
 ```bash
