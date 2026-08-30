@@ -233,11 +233,12 @@ test("EPUB 结构校验：mimetype 首个 STORED、totalChapters 与 spine 一�
 // ---- 8. 缓存命中 ----
 test("第二次 download 同书直接 done（命中缓存）", async () => {
   await waitDone((await req("POST", "/api/download", { source: "placeholder", sourceId: "p1_0" })).json.data.jobId);
-  // 上面已完成 p1_0，这里再下一次
+  // 上面已完成 p1_0，这里再下一次：create 异步跑 _run，增量比对命中缓存 → done
   const d = await req("POST", "/api/download", { source: "placeholder", sourceId: "p1_0" });
   assert.strictEqual(d.status, 200, d.text);
-  const job = jobs.get(d.json.data.jobId);
+  const job = await waitDone(d.json.data.jobId);
   assert.strictEqual(job.status, "done", "缓存命中应直接 done");
+  assert.strictEqual(job.updated, false, "命中缓存 updated=false");
   assert.ok(job.epubUrl.endsWith("books/placeholder/p1_0.epub"));
   const file = path.join(dataDir, "books", "placeholder", "p1_0.epub");
   assert.ok(fs.existsSync(file), "EPUB 文件已落盘");
@@ -283,6 +284,89 @@ test("抓取中断：目录为空 → job failed + SOURCE_ERROR", async () => {
     // waitDone 遇 failed 会返回 job 本身（不再抛错）
     assert.strictEqual(j.status, "failed");
     assert.strictEqual(j.error.code, "SOURCE_ERROR");
+  } finally {
+    jobs.adapters.set("placeholder", orig);
+  }
+});
+
+// ---- 11. 增量更新 ----
+// 先用固定 128 章跑完一本，再覆盖 placeholder adapter 以可控地改变章数并记录 getChapter 调用。
+async function downloadAndWait(source, sourceId, body) {
+  const d = await req("POST", "/api/download", { source, sourceId, ...body });
+  assert.strictEqual(d.status, 200, d.text);
+  return waitDone(d.json.data.jobId);
+}
+
+test("增量更新：章节数相同 → 命中缓存 updated=false，不调 getChapter", async () => {
+  // 先全量下载一本占位书（128 章）
+  const first = await downloadAndWait("placeholder", "incr_same", { refresh: false });
+  assert.strictEqual(first.status, "done");
+  assert.strictEqual(first.updated, true, "首次下载应真抓");
+
+  // 覆盖 adapter 记录 getChapter 调用，getCatalog 仍返回 128 章
+  const orig = jobs.adapters.get("placeholder");
+  let chapterCalls = 0;
+  jobs.adapters.set("placeholder", {
+    ...orig,
+    async getChapter() { chapterCalls += 1; return "正文"; },
+  });
+  try {
+    const second = await downloadAndWait("placeholder", "incr_same", { refresh: false });
+    assert.strictEqual(second.status, "done");
+    assert.strictEqual(second.updated, false, "章数相同应命中缓存");
+    assert.strictEqual(chapterCalls, 0, "命中缓存不应调用 getChapter");
+    assert.ok(second.epubUrl.endsWith("books/placeholder/incr_same.epub"));
+  } finally {
+    jobs.adapters.set("placeholder", orig);
+  }
+});
+
+test("增量更新：章节数不同 → 全量重抓 updated=true", async () => {
+  const first = await downloadAndWait("placeholder", "incr_diff", { refresh: false });
+  assert.strictEqual(first.status, "done");
+  assert.strictEqual(first.updated, true);
+
+  // getCatalog 现在返回 130 章（比缓存多 2 章）→ 应重抓
+  const orig = jobs.adapters.get("placeholder");
+  jobs.adapters.set("placeholder", {
+    ...orig,
+    async getCatalog() {
+      return Array.from({ length: 130 }, (_, i) => ({ index: i, title: `第 ${i + 1} 章` }));
+    },
+  });
+  try {
+    const second = await downloadAndWait("placeholder", "incr_diff", { refresh: false });
+    assert.strictEqual(second.status, "done");
+    assert.strictEqual(second.updated, true, "章数不同应重抓");
+    assert.strictEqual(second.progress.total, 130, "重抓后的章数应为 130");
+    // 新 EPUB 已落盘且 totalChapters 更新为 130
+    const file = path.join(dataDir, "books", "placeholder", "incr_diff.epub");
+    assert.ok(fs.existsSync(file), "新 EPUB 已落盘");
+    const JSZip2 = require("jszip");
+    const zip = await JSZip2.loadAsync(fs.readFileSync(file));
+    const opf = await zip.file("OEBPS/content.opf").async("string");
+    assert.ok(opf.includes('property="totalChapters">130<'), "重抓后 totalChapters=130");
+  } finally {
+    jobs.adapters.set("placeholder", orig);
+  }
+});
+
+test("增量更新：强制刷新(refresh=true)即使章数相同也全量重抓 updated=true", async () => {
+  const first = await downloadAndWait("placeholder", "incr_force", { refresh: false });
+  assert.strictEqual(first.updated, true);
+
+  // 章数不变（128），但 refresh=true → 强制重抓
+  const orig = jobs.adapters.get("placeholder");
+  let chapterCalls = 0;
+  jobs.adapters.set("placeholder", {
+    ...orig,
+    async getChapter() { chapterCalls += 1; return "正文"; },
+  });
+  try {
+    const forced = await downloadAndWait("placeholder", "incr_force", { refresh: true });
+    assert.strictEqual(forced.status, "done");
+    assert.strictEqual(forced.updated, true, "强制刷新应真抓");
+    assert.ok(chapterCalls >= 128, "强制刷新应重新抓取全部章节");
   } finally {
     jobs.adapters.set("placeholder", orig);
   }

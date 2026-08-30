@@ -156,6 +156,7 @@ function buildApp(cfg) {
           progress: job.progress || { crawled: 0, total: 0 },
           epubUrl: job.epubUrl || null,
           error: job.error ? { code: job.error.code, message: job.error.message } : null,
+          updated: job.updated ?? false,
         });
         return;
       }

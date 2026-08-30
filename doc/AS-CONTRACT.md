@@ -57,8 +57,8 @@
 
 ### 2.4 POST /api/download
 请求：`{"source":"fanqie","sourceId":"7542602438201576472","refresh":false}`
-- `refresh=false`：有缓存 → 任务直接 done 返回现有 epubUrl。
-- `refresh=true`：强制重抓并重打 EPUB。
+- `refresh=false`：若已有缓存且章节数与最新目录一致 → 任务直接 done（updated=false，返回现有 epubUrl，不重抓）；若缓存章节数不一致或缓存损坏 → 全量重抓（updated=true）。
+- `refresh=true`：强制全量重抓并重打 EPUB（updated=true）。
 
 响应：`{"ok":true,"data":{"jobId":"fanqie.7542602438201576472.a1b2"}}`
 
@@ -69,10 +69,12 @@
   "status":"running",
   "progress":{"crawled":120,"total":422},
   "epubUrl":null,
-  "error":null}}
+  "error":null,
+  "updated":false}}
 ```
 - `done` 时 `epubUrl` 必须非空。
 - `failed` 时 `error` = `{code, message}`。
+- `updated` 布尔字段：true=本次真正重抓重打；false=命中缓存。
 - jobId 至少存活 24h；过期返回 `JOB_NOT_FOUND`。
 - 同 bookId 并发去重：返回同一 jobId。
 
@@ -145,7 +147,7 @@ data/
 
 ### 4.3 抓书流程（download 任务）
 1. 校验 source/sourceId。
-2. 有缓存 && !refresh → 任务直接 done，返回 epubUrl。
+2. 增量更新：!refresh 且缓存章数与最新目录一致 → 任务直接 done，返回现有 epubUrl（updated=false）；否则全量重抓（updated=true）。
 3. `getBookInfo(sourceId)` 拿元信息；失败降级用 search 时带的信息。
 4. `getCatalog(sourceId)` 拿目录。
 5. 封面转存：`getCover` 或 getBookInfo.cover URL → 存 `imgs/` → meta 用 AS 地址。

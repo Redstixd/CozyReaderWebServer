@@ -178,10 +178,10 @@ function cleanChapterContent(html) {
   s = s.replace(/<[^>]+>/g, "");
   // 4. 转义还原
   s = s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&").replace(/&nbsp;/g, " ").replace(/&#160;/g, " ");
-  // 5. 空行压缩 + 去首尾空白行
+  // 5. 空行压缩 + 去首尾空白行（含行首残留的 &nbsp; 缩进实体）
   const lines = s
     .split(/\r?\n/)
-    .map((l) => l.replace(/\s+/g, " ").trim())
+    .map((l) => l.replace(/^(?:&nbsp;|&#160;|\s|\u00A0)+|(?:&nbsp;|&#160;|\s|\u00A0)+$/g, "").replace(/[ \t\u00A0]+/g, " ").trim())
     .filter((l) => l.length > 0);
   return lines.join("\n\n");
 }
