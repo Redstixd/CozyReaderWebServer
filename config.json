@@ -1,0 +1,17 @@
+{
+  "port": 7765,
+  "host": "0.0.0.0",
+  "dataDir": "./data",
+  "crawl": {
+    "chapterConcurrency": 2,
+    "chapterIntervalMs": 200,
+    "chapterTimeoutMs": 15000,
+    "chapterRetries": 1,
+    "perSourceRate": 5
+  },
+  "jobTtlMs": 86400000,
+  "coverTimeoutMs": 10000,
+  "searchTimeoutMs": 8000,
+  "ruleFiles": ["main.json"],
+  "sources": {}
+}

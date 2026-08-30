@@ -1,0 +1,289 @@
+"use strict";
+
+const { test, before, after } = require("node:test");
+const assert = require("node:assert");
+const path = require("node:path");
+const fs = require("node:fs");
+const os = require("node:os");
+const http = require("node:http");
+
+const JSZip = require("jszip");
+const { loadConfig } = require("../lib/config");
+const { buildApp } = require("../server");
+
+let server;
+let base;
+let dataDir;
+let jobs;
+
+before(async () => {
+  dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "cozyreader-as-"));
+  const cfg = loadConfig();
+  // 加速占位书抓取，避免 128 章 * 200ms 的长时间等待
+  cfg.dataDir = dataDir;
+  cfg.port = 0;
+  cfg.crawl = {
+    chapterConcurrency: 8,
+    chapterIntervalMs: 1,
+    chapterTimeoutMs: 15000,
+    chapterRetries: 1,
+    perSourceRate: 500,
+  };
+  const { app, jobs: jm } = buildApp(cfg);
+  jobs = jm;
+  await new Promise((resolve) => {
+    server = app.listen(0, "127.0.0.1", () => resolve());
+  });
+  base = `http://127.0.0.1:${server.address().port}`;
+});
+
+after(async () => {
+  if (server) await new Promise((r) => server.close(r));
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
+/** 小请求助手 */
+function req(method, p, body) {
+  return new Promise((resolve, reject) => {
+    const data = body !== undefined ? JSON.stringify(body) : null;
+    const u = new URL(p, base);
+    const r = http.request(
+      u,
+      {
+        method,
+        headers: {
+          "Content-Type": "application/json",
+          ...(data ? { "Content-Length": Buffer.byteLength(data) } : {}),
+        },
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf-8");
+          let json = null;
+          try { json = JSON.parse(text); } catch { /* 非 JSON */ }
+          resolve({ status: res.statusCode, headers: res.headers, text, json });
+        });
+      }
+    );
+    r.on("error", reject);
+    if (data) r.write(data);
+    r.end();
+  });
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function waitDone(jobId, timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const r = await req("GET", `/api/jobs/${encodeURIComponent(jobId)}`);
+    assert.strictEqual(r.status, 200, `poll job ${jobId} -> ${r.text}`);
+    const job = r.json.data;
+    if (job.status === "done" || job.status === "failed") return job;
+    assert.ok(Date.now() < deadline, "job 超时未完成");
+    await sleep(300);
+  }
+}
+
+// ---- 1. /health ----
+test("GET /health 返回服务信息与源列表", async () => {
+  const r = await req("GET", "/health");
+  assert.strictEqual(r.status, 200);
+  assert.strictEqual(r.json.ok, true);
+  assert.strictEqual(r.json.data.service, "cozy-reader-as");
+  assert.strictEqual(r.json.data.version, "0.1.0");
+  const ids = r.json.data.sources.map((s) => s.id);
+  assert.ok(ids.includes("fanqie"), "应包含 fanqie");
+  assert.ok(ids.includes("placeholder"), "应包含 placeholder");
+});
+
+// ---- 2. OPTIONS 预检 ----
+test("OPTIONS 预检返回 204 + CORS 头", async () => {
+  const r = await req("OPTIONS", "/api/search");
+  assert.strictEqual(r.status, 204);
+  assert.strictEqual(r.headers["access-control-allow-origin"], "*");
+  assert.strictEqual(r.headers["access-control-allow-methods"], "GET, POST, OPTIONS");
+  assert.strictEqual(r.headers["access-control-allow-headers"], "Content-Type");
+});
+
+// ---- 3. /api/sources ----
+test("GET /api/sources 返回源列表且带 enabled", async () => {
+  const r = await req("GET", "/api/sources");
+  assert.strictEqual(r.status, 200);
+  assert.strictEqual(r.json.ok, true);
+  assert.ok(Array.isArray(r.json.data));
+  const fanqie = r.json.data.find((s) => s.id === "fanqie");
+  assert.ok(fanqie);
+  assert.strictEqual(fanqie.enabled, true);
+  assert.strictEqual(fanqie.name, "番茄小说");
+});
+
+// ---- 4. 搜索校验 ----
+test("POST /api/search 缺 keyword 返回 400", async () => {
+  const r = await req("POST", "/api/search", {});
+  assert.strictEqual(r.status, 400);
+  assert.strictEqual(r.json.error.code, "BAD_REQUEST");
+});
+
+test("POST /api/search 指定不存在的 source 返回 404", async () => {
+  const r = await req("POST", "/api/search", { keyword: "斗破", source: "nope" });
+  assert.strictEqual(r.status, 404);
+  assert.strictEqual(r.json.error.code, "SOURCE_NOT_FOUND");
+});
+
+test("POST /api/search 走 placeholder 返回结果", async () => {
+  const r = await req("POST", "/api/search", { keyword: "斗破", source: "placeholder" });
+  assert.strictEqual(r.status, 200);
+  assert.strictEqual(r.json.ok, true);
+  const d = r.json.data;
+  assert.strictEqual(d.keyword, "斗破");
+  assert.strictEqual(d.page, 1);
+  assert.strictEqual(d.hasMore, false);
+  assert.ok(Array.isArray(d.results) && d.results.length > 0);
+  const item = d.results[0];
+  for (const k of ["bookId", "source", "sourceId", "title", "author", "intro", "category", "status", "lastUpdate", "totalChapters", "words"]) {
+    assert.ok(k in item, `结果缺少字段 ${k}`);
+  }
+  assert.ok(item.bookId.startsWith("placeholder:"));
+});
+
+// ---- 5/6/7. 下载 → 轮询 → 拉回 EPUB 并校验 ----
+test("placeholder 全链路：download → job 轮询 → 合法 EPUB", async () => {
+  const d = await req("POST", "/api/download", { source: "placeholder", sourceId: "p1_0" });
+  assert.strictEqual(d.status, 200, d.text);
+  assert.strictEqual(d.json.ok, true);
+  const jobId = d.json.data.jobId;
+  assert.ok(jobId.startsWith("placeholder.p1_0."));
+
+  const job = await waitDone(jobId);
+  assert.ok(job.epubUrl, "done 任务应有 epubUrl");
+  assert.ok(job.epubUrl.startsWith("/static/books/"));
+
+  // 拉回 EPUB（用 http.get 拿 Buffer）
+  const epubBuf = await new Promise((resolve, reject) => {
+    const u = new URL(job.epubUrl, base);
+    http.get(u, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve(Buffer.concat(chunks)));
+    }).on("error", reject);
+  });
+  assert.strictEqual(epubBuf.length > 100, true, "EPUB 有内容");
+  // 解压校验（契约 3）
+  const zip = await JSZip.loadAsync(epubBuf);
+  const entryNames = Object.keys(zip.files);
+  assert.strictEqual(entryNames[0], "mimetype", "mimetype 必须是第一个条目");
+  const mime = zip.file("mimetype");
+  assert.strictEqual(mime._data.compression.magic.charCodeAt(0), 0, "mimetype 必须 STORED");
+  assert.strictEqual(await mime.async("string"), "application/epub+zip");
+  const opf = await zip.file("OEBPS/content.opf").async("string");
+  assert.ok(opf.includes(">placeholder:p1_0<"), "dc:identifier 应为 bookId");
+  const spineCount = (opf.match(/<itemref/g) || []).length;
+  assert.strictEqual(spineCount, 129, "spine = titles + 128 章");
+});
+
+test("EPUB 结构校验：mimetype 首个 STORED、totalChapters 与 spine 一致、章纯文本", async () => {
+  // 直接调 buildEpub 验证（HTTP 侧已验过下载 200）
+  const { buildEpub } = require("../lib/epub");
+  const chapters = Array.from({ length: 5 }, (_, i) => ({
+    title: `第 ${i + 1} 章`,
+    text: `第 ${i + 1} 章的正文第一段。\n\n第二段 <script>alert(1)</script> 已转义。`,
+  }));
+  const meta = {
+    bookId: "placeholder:p1_0", title: "测试书", author: "示例作者",
+    date: "2026-08-29", source: "placeholder", sourceId: "p1_0",
+    totalChapters: 5, status: "连载中", category: "测试", words: "5000",
+  };
+  const buf = await buildEpub(meta, chapters);
+  const zip = await JSZip.loadAsync(buf);
+  const entryNames = Object.keys(zip.files);
+  assert.strictEqual(entryNames[0], "mimetype", "mimetype 必须是第一个条目");
+  const mime = zip.file("mimetype");
+  assert.strictEqual(mime._data.compression.magic.charCodeAt(0), 0, "mimetype 必须 STORED");
+  assert.strictEqual(await mime.async("string"), "application/epub+zip");
+
+  const opf = await zip.file("OEBPS/content.opf").async("string");
+  assert.ok(opf.includes(">placeholder:p1_0<"), "dc:identifier 应为 bookId");
+  assert.ok(opf.includes('property="totalChapters"'), "含 totalChapters meta");
+  assert.ok(opf.includes(">5<"), "totalChapters 应为 5");
+  // spine 顺序 = 章节顺序，共 6 项（titles + 5 章）
+  const spineItems = [...opf.matchAll(/<itemref idref="ch(\d{4})"\/>/g)].map((m) => m[1]);
+  assert.deepStrictEqual(spineItems, ["0001", "0002", "0003", "0004", "0005"]);
+  // manifest id 命名 ch{index+1:04d}
+  assert.ok(opf.includes('id="ch0001" href="chapters/0001.xhtml"'));
+  assert.ok(opf.includes('id="ch0005" href="chapters/0005.xhtml"'));
+
+  const ch1 = await zip.file("OEBPS/chapters/0001.xhtml").async("string");
+  assert.ok(ch1.includes("<h1>第 1 章</h1>"), "章含 h1 标题");
+  const pCount = (ch1.match(/<p>/g) || []).length;
+  assert.strictEqual(pCount, 2, "两段正文 = 两个 <p>");
+  assert.ok(ch1.includes("&lt;script&gt;"), "正文标签已转义");
+  assert.ok(!/<script>/.test(ch1.replace("&lt;script&gt;", "")), "无原始 script 标签");
+
+  const ncx = await zip.file("OEBPS/toc.ncx").async("string");
+  const navPoints = (ncx.match(/<navPoint/g) || []).length;
+  assert.strictEqual(navPoints, 5, "toc.ncx 应有 5 个 navPoint");
+
+  const titles = await zip.file("OEBPS/titles.xhtml").async("string");
+  assert.ok(titles.includes("测试书"), "书名页含书名");
+});
+
+// ---- 8. 缓存命中 ----
+test("第二次 download 同书直接 done（命中缓存）", async () => {
+  await waitDone((await req("POST", "/api/download", { source: "placeholder", sourceId: "p1_0" })).json.data.jobId);
+  // 上面已完成 p1_0，这里再下一次
+  const d = await req("POST", "/api/download", { source: "placeholder", sourceId: "p1_0" });
+  assert.strictEqual(d.status, 200, d.text);
+  const job = jobs.get(d.json.data.jobId);
+  assert.strictEqual(job.status, "done", "缓存命中应直接 done");
+  assert.ok(job.epubUrl.endsWith("books/placeholder/p1_0.epub"));
+  const file = path.join(dataDir, "books", "placeholder", "p1_0.epub");
+  assert.ok(fs.existsSync(file), "EPUB 文件已落盘");
+});
+
+// ---- 9. 错误信封 ----
+test("sourceId 含冒号被 400 拒绝", async () => {
+  const r = await req("POST", "/api/download", { source: "placeholder", sourceId: "a:b" });
+  assert.strictEqual(r.status, 400);
+  assert.strictEqual(r.json.error.code, "BAD_REQUEST");
+});
+
+test("下载不存在的 source 返回 404 SOURCE_NOT_FOUND", async () => {
+  const r = await req("POST", "/api/download", { source: "nope", sourceId: "x" });
+  assert.strictEqual(r.status, 404);
+  assert.strictEqual(r.json.error.code, "SOURCE_NOT_FOUND");
+});
+
+test("查询不存在的 job 返回 404 JOB_NOT_FOUND", async () => {
+  const r = await req("GET", "/api/jobs/foo.bar.deadbeef");
+  assert.strictEqual(r.status, 404);
+  assert.strictEqual(r.json.error.code, "JOB_NOT_FOUND");
+});
+
+test("静态 book 不存在返回 404 BOOK_NOT_FOUND", async () => {
+  const r = await req("GET", "/static/books/placeholder/missing.epub");
+  assert.strictEqual(r.status, 404);
+  assert.strictEqual(r.json.error.code, "BOOK_NOT_FOUND");
+});
+
+// ---- 10. 抓取中断 → failed ----
+test("抓取中断：目录为空 → job failed + SOURCE_ERROR", async () => {
+  // 用 fanqie 的 getCatalog 强制抛错：临时替换 registry 里的 adapter
+  const orig = jobs.adapters.get("placeholder");
+  jobs.adapters.set("placeholder", {
+    ...orig,
+    async getCatalog() { throw new Error("目录解析失败(测试)"); },
+  });
+  try {
+    const d = await req("POST", "/api/download", { source: "placeholder", sourceId: "failcase" });
+    assert.strictEqual(d.status, 200, d.text);
+    const j = await waitDone(d.json.data.jobId);
+    // waitDone 遇 failed 会返回 job 本身（不再抛错）
+    assert.strictEqual(j.status, "failed");
+    assert.strictEqual(j.error.code, "SOURCE_ERROR");
+  } finally {
+    jobs.adapters.set("placeholder", orig);
+  }
+});
