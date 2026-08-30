@@ -450,3 +450,29 @@ test("部分下载：from/to 范围只抓该切片，EPUB 章数=切片长度", 
   const tm = opf.match(/<meta property="totalChapters">(\d+)<\/meta>/);
   assert.strictEqual(tm ? Number(tm[1]) : 0, 5, "totalChapters 应为切片长度 5");
 });
+
+// ---- 13. 部分下载不得覆盖已缓存全书（数据丢失修复） ----
+test("部分下载：全书已缓存时拒绝切片，且不覆盖已有全书", async () => {
+  // 先全量下载一本占位书（128 章），落盘全书
+  const full = await downloadAndWait("placeholder", "range_clobber", { refresh: false });
+  assert.strictEqual(full.status, "done");
+  assert.strictEqual(full.updated, true, "首次应真抓全书");
+  const file = path.join(dataDir, "books", "placeholder", "range_clobber.epub");
+  assert.ok(fs.existsSync(file), "全书已落盘");
+  const before = fs.readFileSync(file);
+
+  // 对同一 source/sourceId 发起部分下载 [0..4] → 应被拒绝，不得覆盖全书
+  const partial = await downloadAndWait("placeholder", "range_clobber", { from: 0, to: 4 });
+  assert.strictEqual(partial.status, "failed", "全书已缓存时部分下载应被拒绝");
+  assert.strictEqual(partial.error.code, "BAD_REQUEST", "拒绝错误码应为 BAD_REQUEST");
+  assert.ok(/全书|整本|增量/.test(partial.error.message), "错误信息应提示全书已缓存，请用整本/增量更新");
+
+  // 全书文件必须未被覆盖（字节不变）
+  const after = fs.readFileSync(file);
+  assert.ok(before.equals(after), "已有全书不得被切片覆盖");
+  const JSZip3 = require("jszip");
+  const zip = await JSZip3.loadAsync(after);
+  const opf = await zip.file("OEBPS/content.opf").async("string");
+  const tm = opf.match(/<meta property="totalChapters">(\d+)<\/meta>/);
+  assert.strictEqual(tm ? Number(tm[1]) : 0, 128, "全书 totalChapters 仍为 128");
+});
